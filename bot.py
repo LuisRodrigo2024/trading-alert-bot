@@ -1,7 +1,8 @@
 import os
-import time
-import requests
 import logging
+import yfinance as yf
+import torch
+from transformers import pipeline
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
@@ -16,94 +17,93 @@ STOCKS = [
     "META", "AMD", "AVGO", "MU", "QCOM"
 ]
 
-COMMISSION = 20  # $10 buy + $10 sell
+COMMISSION = 20
 
 logging.basicConfig(level=logging.INFO)
 
 # =========================
-# DATA LAYER (SIMPLIFIED)
+# IA SENTIMENT MODEL
 # =========================
 
-def get_price_change(symbol):
-    """
-    Simulación simple de movimiento de precio.
-    En producción puedes reemplazar con Yahoo Finance / Finnhub / AlphaVantage.
-    """
+sentiment_model = pipeline(
+    "sentiment-analysis",
+    model="ProsusAI/finbert"
+)
+
+# =========================
+# MARKET DATA
+# =========================
+
+def get_market_data(symbol):
     try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-        r = requests.get(url)
-        data = r.json()
+        stock = yf.Ticker(symbol)
+        hist = stock.history(period="2d")
 
-        result = data["chart"]["result"][0]
-        meta = result["meta"]
+        if len(hist) < 2:
+            return 0
 
-        current = meta["regularMarketPrice"]
-        previous = meta["previousClose"]
+        last_close = hist["Close"].iloc[-1]
+        prev_close = hist["Close"].iloc[-2]
 
-        change_pct = ((current - previous) / previous) * 100
-        return change_pct
+        change_pct = ((last_close - prev_close) / prev_close) * 100
+        return float(change_pct)
+
     except:
         return 0
 
+# =========================
+# NEWS (SIMULADO + REAL FEED READY)
+# =========================
 
-def get_news_sentiment(symbol):
+def get_news_text(symbol):
     """
-    Simulación simple de sentimiento de noticias.
-    (en producción: NLP real o API de noticias)
+    En versión pro real:
+    aquí conectarías NewsAPI / Yahoo / RSS
     """
+    return f"{symbol} company earnings strong growth innovation AI expansion"
+
+# =========================
+# IA SENTIMENT ANALYSIS
+# =========================
+
+def analyze_sentiment(text):
     try:
-        url = f"https://news.google.com/rss/search?q={symbol}+stock"
-        r = requests.get(url)
+        result = sentiment_model(text)[0]
 
-        text = r.text.lower()
+        label = result["label"]
+        score = result["score"]
 
-        positive_words = ["upgrade", "growth", "profit", "beats", "strong"]
-        negative_words = ["loss", "drop", "lawsuit", "decline", "weak"]
+        if label.lower() == "positive":
+            return score
+        elif label.lower() == "negative":
+            return -score
+        else:
+            return 0
 
-        score = 0
-
-        for w in positive_words:
-            if w in text:
-                score += 0.3
-
-        for w in negative_words:
-            if w in text:
-                score -= 0.3
-
-        return score
     except:
         return 0
 
-
 # =========================
-# DECISION ENGINE
+# DECISION ENGINE PRO
 # =========================
 
-def decision_engine(price_change, sentiment_score, expected_profit):
+def decision_engine(price_change, sentiment_score):
 
+    expected_profit = abs(price_change) * 12
+
+    # 💰 filtro comisión
     if expected_profit < COMMISSION:
-        return {
-            "signal": "HOLD",
-            "reason": "Ganancia no cubre comisión ($20)"
-        }
+        return "HOLD", "No cubre comisión ($20)"
 
-    if price_change > 2 and sentiment_score > 0.2:
-        return {
-            "signal": "BUY",
-            "reason": "Tendencia alcista + noticias positivas"
-        }
+    score = price_change + (sentiment_score * 5)
 
-    if price_change < -2 and sentiment_score < -0.2:
-        return {
-            "signal": "SELL",
-            "reason": "Caída + noticias negativas"
-        }
+    if score > 3:
+        return "BUY", f"Score positivo ({score:.2f})"
 
-    return {
-        "signal": "HOLD",
-        "reason": "Sin señal clara"
-    }
+    if score < -3:
+        return "SELL", f"Score negativo ({score:.2f})"
 
+    return "HOLD", f"Sin señal clara ({score:.2f})"
 
 # =========================
 # TELEGRAM COMMANDS
@@ -111,9 +111,8 @@ def decision_engine(price_change, sentiment_score, expected_profit):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 Trading Alert Bot activo\nUsa /scan para analizar mercado"
+        "🚀 PRO Trading AI Bot activo"
     )
-
 
 async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -121,64 +120,25 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for stock in STOCKS:
 
-        price_change = get_price_change(stock)
-        sentiment = get_news_sentiment(stock)
+        price_change = get_market_data(stock)
 
-        # estimación simple de profit (modelo simplificado)
-        expected_profit = abs(price_change) * 10
+        news_text = get_news_text(stock)
+        sentiment = analyze_sentiment(news_text)
 
-        decision = decision_engine(price_change, sentiment, expected_profit)
+        signal, reason = decision_engine(price_change, sentiment)
 
         msg = (
             f"📊 {stock}\n"
-            f"📈 Cambio: {price_change:.2f}%\n"
-            f"🧠 Sentimiento: {sentiment:.2f}\n"
-            f"💰 Est. Profit: ${expected_profit:.2f}\n"
-            f"🤖 Señal: {decision['signal']}\n"
-            f"📌 {decision['reason']}\n"
+            f"📈 Precio: {price_change:.2f}%\n"
+            f"🧠 Sentimiento AI: {sentiment:.2f}\n"
+            f"🤖 Señal: {signal}\n"
+            f"📌 {reason}\n"
             "----------------------"
         )
 
         messages.append(msg)
 
     await update.message.reply_text("\n".join(messages))
-
-
-# =========================
-# LOOP AUTOMÁTICO (TIME REAL)
-# =========================
-
-def background_loop(app):
-
-    while True:
-        try:
-            for stock in STOCKS:
-
-                price_change = get_price_change(stock)
-                sentiment = get_news_sentiment(stock)
-                expected_profit = abs(price_change) * 10
-
-                decision = decision_engine(price_change, sentiment, expected_profit)
-
-                if decision["signal"] in ["BUY", "SELL"]:
-
-                    message = (
-                        f"🚨 ALERTA {stock}\n"
-                        f"Señal: {decision['signal']}\n"
-                        f"Motivo: {decision['reason']}\n"
-                        f"📈 Cambio: {price_change:.2f}%\n"
-                        f"🧠 Sentimiento: {sentiment:.2f}"
-                    )
-
-                    # enviar a chat principal (si tienes chat_id puedes fijarlo)
-                    for chat in app.chat_data.values():
-                        pass
-
-        except Exception as e:
-            logging.error(e)
-
-        time.sleep(60)
-
 
 # =========================
 # MAIN
@@ -187,7 +147,7 @@ def background_loop(app):
 def main():
 
     if not TOKEN:
-        print("❌ TOKEN no configurado")
+        print("TOKEN missing")
         return
 
     app = ApplicationBuilder().token(TOKEN).build()
@@ -195,10 +155,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("scan", scan))
 
-    print("🤖 Bot corriendo...")
-
+    print("🚀 PRO AI Bot running...")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
